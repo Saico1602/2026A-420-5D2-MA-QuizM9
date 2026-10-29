@@ -26,6 +26,18 @@ import { Server } from 'socket.io';
 import * as repository from './repository/index.js';
 import { closeQuestionIfExpired, publicState } from './game.js';
 
+/** Le chat de chaque partie, en mémoire : code → { enabled, messages }. */
+const chats = new Map();
+let nextMessageId = 1;
+
+/** Retourne le chat de cette partie. Le crée, actif et vide, au premier appel. */
+function chatOf(code) {
+  if (!chats.has(code)) {
+    chats.set(code, { enabled: true, messages: [] });
+  }
+  return chats.get(code);
+}
+
 /** Le serveur Socket.IO ; null tant que attachRealtime n'a pas été appelé. */
 let io = null;
 
@@ -48,11 +60,52 @@ export function attachRealtime(server) {
           if (room !== socket.id) socket.leave(room);
         }
         socket.join(game.code);
+        socket.data.code = game.code;
 
         // Comme GET /api/games/:code : une échéance passée pendant que le
         // serveur était arrêté est constatée ici.
         await closeQuestionIfExpired(game);
         ack({ game: await publicState(game.code) });
+      } catch (err) {
+        console.error(err);
+        ack({ error: 'Erreur du serveur.' });
+      }
+    });
+
+    socket.on('chat:send', async (message, ack) => {
+      if (typeof ack !== 'function') return;
+
+      try {
+        const code = socket.data.code;
+        if (!code) {
+          return ack({ error: "Suivez d'abord une partie." });
+        }
+
+        let text = typeof message?.text === 'string' ? message.text.trim() : '';
+        if (!text || text.length > 200) {
+          return ack({ error: 'Le message doit faire entre 1 et 200 caractères.' });
+        }
+
+        const game = await repository.findGameByCode(code);
+        if (!game) {
+          return ack({ error: 'Partie introuvable.' });
+        }
+
+        const player = await repository.findPlayer(game.id, message?.nickname);
+        if (!player) {
+          return ack({ error: 'Joueur introuvable.' });
+        }
+
+        const msg = {
+          id: nextMessageId++,
+          nickname: player.nickname,
+          text,
+          sentAt: Date.now(),
+        };
+
+        chatOf(code).messages.push(msg);
+        io.to(code).emit('chat:message', msg);
+        ack({});
       } catch (err) {
         console.error(err);
         ack({ error: 'Erreur du serveur.' });
